@@ -1,0 +1,23 @@
+# .github/workflows/auto-update-pr.yml
+
+name: "🤖 Auto Update PR Description"
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+jobs:
+  update-pr-description:
+    # 调用本地的可复用工作流
+    uses: ./.github/workflows/pr-description-generator.yml
+    with:
+      # 传入必要的参数
+      pr_number: ${{ github.event.pull_request.number }}
+      source_branch: ${{ github.event.pull_request.head.ref }}
+      target_branch: ${{ github.event.pull_request.base.ref }}
+      pr_author: ${{ github.event.pull_request.user.login }}
+    secrets: inherit
+    permissions:
+      contents: read
+      # 为此 job 授予写 PR 的权限
+      pull-requests: write
