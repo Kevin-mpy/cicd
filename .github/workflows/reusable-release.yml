@@ -1,0 +1,339 @@
+name: "🚀 Reusable: Release Creator"
+
+# 触发器：当一个 'v*' 格式的标签被推送时，或手动触发时运行
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Release tag to create (e.g., v0.0.1)'
+        required: false
+        type: string
+      target_branch:
+        description: 'Target branch to base the tag on'
+        required: false
+        type: string
+      prerelease:
+        description: 'Mark as pre-release version'
+        required: false
+        type: string
+    secrets:
+      # 新增：让调用者可以传入 Webhook URL
+      RELEASE_WEBHOOK_URL:
+        description: 'The URL to send the release notification to'
+        required: false # 设置为 false，这样不配通知的仓库就不会报错
+  # 新增内容如下：
+  # 添加一个 push 触发器，但告诉它忽略所有文件的变更。
+  # 这会阻止 GitHub Actions 在 push 时为这个文件创建“无任务运行”的失败记录。
+  push:
+    paths-ignore:
+      - '**'
+
+jobs:
+  create-release:
+    name: 📦 Create Release with GitHub CLI
+    permissions:
+      contents: write
+    runs-on: github-runner
+
+    env:
+      WEBHOOK_URL: ${{ secrets.RELEASE_WEBHOOK_URL }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      # 步骤 1: 检出代码库
+      - name: 🔄 Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 获取所有历史记录，这对 gh generate-notes 至关重要
+
+      # 步骤 2: 收集发布所需的信息
+      - name: 🏷️ Gather Release Info
+        id: release_info
+        run: |
+          # 初始化变量
+          TAG_NAME=""
+          TARGET_BRANCH=""
+          IS_PRERELEASE=""
+          IS_TAG_PUSH="false"
+
+          # 1. 确定触发方式和标签 (Tag)
+          if [[ "${{ github.event_name }}" == "push" && "${{ startsWith(github.ref, 'refs/tags/') }}" == "true" ]]; then
+            # 场景 A: 由推送标签自动触发
+            IS_TAG_PUSH="true"
+            TAG_NAME=${GITHUB_REF#refs/tags/}
+            echo "✅ Triggered by tag push."
+          elif [[ -n "${{ inputs.tag }}" ]]; then
+            # 场景 B: 由手动调用并传入 tag 触发
+            TAG_NAME="${{ inputs.tag }}"
+            echo "✅ Triggered manually with input tag."
+          else
+            # 场景 C: 无法确定标签，失败
+            echo "::error::Could not determine tag. Please provide it via 'inputs' or trigger via a tag push."
+            exit 1
+          fi
+          
+          # 2. 确定目标分支 (Target Branch)
+          if [[ -n "${{ inputs.target_branch }}" ]]; then
+            TARGET_BRANCH="${{ inputs.target_branch }}"
+          else
+            TARGET_BRANCH=$(git remote show origin | grep 'HEAD branch' | cut -d' ' -f5 || echo 'main')
+          fi
+
+          # 3. 确定是否预发布
+          if [[ -n "${{ inputs.prerelease }}" ]]; then
+            IS_PRERELEASE="${{ inputs.prerelease }}"
+          elif [[ "$TAG_NAME" == *-* ]]; then
+            IS_PRERELEASE="true"
+          else
+            IS_PRERELEASE="false"
+          fi
+
+          # 4. 获取上一个标签
+          git fetch --tags
+          PREVIOUS_TAG=$(git tag --sort=-creatordate | grep -v "^$TAG_NAME$" | head -n 1)
+          
+          # --- 输出所有收集到的信息 ---
+          echo "tag_name=$TAG_NAME" >> "$GITHUB_OUTPUT"
+          echo "previous_tag=$PREVIOUS_TAG" >> "$GITHUB_OUTPUT"
+          echo "target_branch=$TARGET_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=$IS_PRERELEASE" >> "$GITHUB_OUTPUT"
+          # 新增：输出触发类型，供后续步骤使用
+          echo "is_tag_push=$IS_TAG_PUSH" >> "$GITHUB_OUTPUT"
+
+          echo "--- Release Info Gathered ---"
+          echo "📝 Release Tag: $TAG_NAME"
+          echo "🎯 Target Branch: $TARGET_BRANCH"
+          echo "📖 Previous Tag: ${PREVIOUS_TAG:-'N/A (first release)'}"
+          echo "🚀 Is Prerelease: $IS_PRERELEASE"
+          echo "⚙️ Triggered by Tag Push: $IS_TAG_PUSH"
+
+      # 步骤 3: 生成 Release Notes (使用更新后的统一逻辑)
+      - name: 📝 Generate Release Notes
+        id: generate_notes
+        run: |
+          START_REF="${{ steps.release_info.outputs.previous_tag }}"
+          END_REF="${{ steps.release_info.outputs.target_branch }}"
+          TAG_NAME="${{ steps.release_info.outputs.tag_name }}"
+          IS_TAG_PUSH="${{ steps.release_info.outputs.is_tag_push }}"
+          NOTES_FILE="releasenotes.md"
+
+          # 初始化 HEAD_REF 变量
+          HEAD_REF=""
+          
+          # 根据上一步的判断结果，直接选择 HEAD 引用
+          if [[ "$IS_TAG_PUSH" == "true" ]]; then
+            HEAD_REF="$TAG_NAME"
+          else
+            HEAD_REF="$END_REF"
+          fi
+          
+          echo "Selected HEAD reference for changelog: '$HEAD_REF'"
+
+          # --- 统一的 API 调用逻辑 (此后所有逻辑都无需再修改) ---
+          if [[ -n "$START_REF" ]]; then
+            echo "This is a subsequent release. Comparing '$START_REF' with '$HEAD_REF'."
+            COMMIT_RANGE="$START_REF...$HEAD_REF"
+            
+            echo "Fetching commits from GitHub API using the 'compare' endpoint..."
+            ALL_COMMITS_JSON=$(gh api --paginate "repos/${{ github.repository }}/compare/$COMMIT_RANGE?per_page=100" \
+              | jq -s 'map(.commits[]) | map(select(.commit.message | startswith("Merge pull request") | not))'
+            )
+          else
+            echo "This is the first release. Fetching all commits up to '$HEAD_REF'."
+            COMMIT_RANGE="$HEAD_REF"
+            
+            echo "Fetching commits from GitHub API using the 'commits' endpoint..."
+            ALL_COMMITS_JSON=$(gh api --paginate "repos/${{ github.repository }}/commits?sha=$COMMIT_RANGE&per_page=100" \
+              | jq -s 'flatten | map(select(.commit.message | startswith("Merge pull request") | not))'
+            )
+          fi
+
+          if [[ -z "$ALL_COMMITS_JSON" || "$ALL_COMMITS_JSON" == "[]" ]]; then
+            echo "::warning::Could not find any commits for this release. The generated notes might be empty."
+            ALL_COMMITS_JSON="[]" # 确保变量是有效的空 JSON 数组
+          fi
+          
+          echo "Generating changelog for commit range: $COMMIT_RANGE"
+
+          # --- A: 生成统计摘要 ---
+          echo "Calculating release statistics..."
+          TOTAL_COMMITS=$(echo "$ALL_COMMITS_JSON" | jq 'length')
+          STATS_SUMMARY=$(git log "$COMMIT_RANGE" --shortstat --pretty=format:"" | tail -n 1 | xargs)
+          FILES_CHANGED=$(echo "$STATS_SUMMARY" | grep -o '[0-9]* files changed' | grep -o '[0-9]*' || echo 0)
+          LINES_ADDED=$(echo "$STATS_SUMMARY" | grep -o '[0-9]* insertions(+)' | grep -o '[0-9]*' || echo 0)
+          LINES_DELETED=$(echo "$STATS_SUMMARY" | grep -o '[0-9]* deletions(-)' | grep -o '[0-9]*' || echo 0)
+          # =================================================================
+          # 核心优化：使用一个更强大的 gh api 命令直接生成贡献者列表
+          # 这个命令结合了您的简化思路和我们之前的修复逻辑
+          # =================================================================
+          echo "Generating robust contributors list..."
+          CONTRIBUTORS_JSON=$(echo "$ALL_COMMITS_JSON" | jq '
+            [
+              .[] |
+              # 路径 1: 如果 .author 存在且不是 Bot，使用它 (最佳情况)
+              if .author and .author.type != "Bot" then
+                {login: .author.login, html_url: .author.html_url, type: "github_user"}
+              # 路径 2 (回退): 如果 .author 为 null，则使用 .commit.author.name
+              elif (.commit.author.name | test("bot|actions"; "i") | not) then
+                {login: .commit.author.name, html_url: null, type: "git_author"}
+              # 其他情况（如 Bot 提交）则忽略
+              else
+                empty
+              end
+            ] | unique_by(.login) # 最后对结果进行去重
+          ')
+          CONTRIBUTORS_COUNT=$(echo "$CONTRIBUTORS_JSON" | jq 'length')
+          
+          > "$NOTES_FILE"
+          echo -e "## 📊 Release Summary\n" >> "$NOTES_FILE"
+          echo -e "- 📝 **Total commits**: $TOTAL_COMMITS" >> "$NOTES_FILE"
+          echo -e "- 👥 **Contributors**: $CONTRIBUTORS_COUNT" >> "$NOTES_FILE"
+          echo -e "- 📁 **Files changed**: $FILES_CHANGED" >> "$NOTES_FILE"
+          echo -e "- ➕ **Lines added**: $LINES_ADDED" >> "$NOTES_FILE"
+          echo -e "- ➖ **Lines deleted**: $LINES_DELETED\n" >> "$NOTES_FILE"
+
+          # --- B: 生成分类变更日志 ---
+          echo "Generating categorized changelog..."
+          COMMIT_LOG=$(echo "$ALL_COMMITS_JSON" | jq -r '
+            .[] | 
+            "- [\(.sha | .[:7])](\(.html_url)) \(.commit.message | split("\n")[0]) - by \(.author.login // .commit.author.name)"
+          ')
+          
+          echo -e "## 🚀 What's Changed\n" >> "$NOTES_FILE"
+          all_patterns=()
+          while IFS='|' read -r pattern emoji display_name; do
+            pattern=$(echo "$pattern" | xargs); emoji=$(echo "$emoji" | xargs); display_name=$(echo "$display_name" | xargs)
+            all_patterns+=("$pattern")
+            commits=$(echo "$COMMIT_LOG" | grep -i -E -- "$pattern" || true)
+            if [[ -n "$commits" ]]; then
+              echo -e "\n### $emoji $display_name\n" >> "$NOTES_FILE"
+              echo "$commits" >> "$NOTES_FILE"
+            fi
+          done <<'CATEGORIES'
+            feat(ure)?(\(.*\))?:      | ✨ | New Features
+            fix(es)?(\(.*\))?:        | 🐛 | Bug Fixes
+            refactor(\(.*\))?:        | 🔨 | Refactoring
+            perf(\(.*\))?:            | ⚡️ | Performance Improvements
+            ci(\(.*\))?:              | 🤖 | CI/CD
+            docs?(\(.*\))?:           | 📚 | Documentation
+            build(\(.*\))?:           | 📦 | Build System
+            test(\(.*\))?:            | ✅ | Tests
+            \bchore(\(.*\))?:         | ⚙️ | Chores
+          CATEGORIES
+          ALL_PATTERNS_REGEX=$(IFS='|'; echo "${all_patterns[*]}")
+          other_commits=$(echo "$COMMIT_LOG" | grep -i -v -E "$ALL_PATTERNS_REGEX" || true)
+          if [[ -n "$other_commits" ]]; then
+            echo -e "\n### 🔧 Other Changes\n" >> "$NOTES_FILE"
+            echo "$other_commits" >> "$NOTES_FILE"
+          fi
+
+          if [[ -n "$START_REF" ]]; then
+            echo -e "\n\n**Full Changelog**: [$START_REF...$TAG_NAME](${{ github.server_url }}/${{ github.repository }}/compare/$START_REF...$TAG_NAME)" >> "$NOTES_FILE"
+          fi
+
+          # =================================================================
+          # 核心修改：生成仅包含用户名的简洁贡献者列表
+          # =================================================================
+          echo "Formatting simplified contributors list..."
+          if [[ $CONTRIBUTORS_COUNT -gt 0 ]]; then
+            # 使用一个 jq 命令高效地将所有贡献者格式化为 Markdown 列表
+            CONTRIBUTORS_MD=$(echo "$CONTRIBUTORS_JSON" | jq -r '.[] | "- @\(.login)"')
+            
+            echo -e "\n## ❤️ Contributors\n" >> "$NOTES_FILE"
+            echo -e "A huge thank you to everyone who contributed to this release:\n" >> "$NOTES_FILE"
+            echo -e "${CONTRIBUTORS_MD}\n" >> "$NOTES_FILE"
+          fi
+
+          echo "Generated changelog content:"
+          cat "$NOTES_FILE"
+          
+          echo "changelog_path=$NOTES_FILE" >> "$GITHUB_OUTPUT"
+
+      # 步骤 4: 使用 GitHub CLI 创建发布
+      - name: 🎉 Create GitHub Release and Tag
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ steps.release_info.outputs.tag_name }}
+          TARGET_BRANCH: ${{ steps.release_info.outputs.target_branch }}
+          IS_PRERELEASE: ${{ steps.release_info.outputs.is_prerelease }}
+        run: |
+          # 准备 gh CLI 命令的通用参数数组
+          # 无论是 create 还是 edit，这些参数都适用
+          args=(
+            --title "🚀 Release $TAG_NAME"
+            --notes-file "${{ steps.generate_notes.outputs.changelog_path }}"
+          )
+          
+          # 如果是预发布，添加 --prerelease 标志
+          if [[ "$IS_PRERELEASE" == "true" ]]; then
+            args+=(--prerelease)
+          fi
+          
+          echo "Checking for existing release with tag: $TAG_NAME"
+          
+          # 使用 if 条件判断 gh release view 的退出状态码
+          # if gh ...; then ...; else ...; fi 结构是 shell 的标准语法
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            echo "✅ Release '$TAG_NAME' already exists. Updating it..."
+            # 如果存在，就编辑现有的 Release
+            gh release edit "$TAG_NAME" "${args[@]}"
+          else
+            echo "🆕 Release '$TAG_NAME' not found. Creating a new one..."
+            # 如果不存在，就创建新的 Release
+            # 注意：create 命令需要额外的 --target 参数
+            gh release create "$TAG_NAME" \
+              --target "$TARGET_BRANCH" \
+              "${args[@]}"
+          fi
+
+      # 步骤 5: 在 Release 创建成功后发送通知
+      - name: '🔔 Send Webhook Notification'
+        # 条件：检查传入的环境变量 WEBHOOK_URL 是否为空
+        if: ${{ success() && env.WEBHOOK_URL != '' }}
+        env:
+          TAG_NAME: ${{ steps.release_info.outputs.tag_name }}
+          TARGET_BRANCH: ${{ steps.release_info.outputs.target_branch }}
+          IS_PRERELEASE: ${{ steps.release_info.outputs.is_prerelease }}
+          REPO_NAME: ${{ github.repository }}
+          RELEASE_URL: "https://github.com/${{ github.repository }}/releases/tag/${{ steps.release_info.outputs.tag_name }}"
+        run: |
+          # 转换布尔值
+          PRERELEASE_BOOL=$( [[ "$IS_PRERELEASE" == "true" ]] && echo true || echo false )
+          # 准备 JSON payload
+          JSON_PAYLOAD=$(printf '{ 
+          "repository": "%s", 
+          "tag": "%s", 
+          "target_branch": "%s", 
+          "prerelease": %s, 
+          "release_url": "%s", 
+          "message": "🚀 New release %s has been published for %s!" 
+          }' 
+          "$REPO_NAME" 
+          "$TAG_NAME" 
+          "$TARGET_BRANCH" 
+          "$PRERELEASE_BOOL" 
+          "$RELEASE_URL" 
+          "$TAG_NAME" 
+          "$REPO_NAME")
+
+          echo "Sending notification to webhook..."
+          echo "Payload: $JSON_PAYLOAD" 
+          
+          # 使用 curl 发送 POST 请求
+          curl -X POST -H "Content-Type: application/json" \
+             -d "$JSON_PAYLOAD" \
+             "$WEBHOOK_URL"
+
+      # 步骤 6: 成功通知
+      - name: ✅ Release Created Successfully
+        if: success()
+        run: |
+          echo "🎊 Release created successfully!"
+          echo "📦 Version: ${{ steps.release_info.outputs.tag_name }}"
+          echo "🔗 View at: https://github.com/${{ github.repository }}/releases/tag/${{ steps.release_info.outputs.tag_name }}"
+
+      # 步骤 7: 失败通知
+      - name: ❌ Release Creation Failed
+        if: failure()
+        run: |
+          echo "💥 Release creation failed! Please check the logs."
