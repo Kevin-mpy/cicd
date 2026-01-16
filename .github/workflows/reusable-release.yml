@@ -33,7 +33,7 @@ jobs:
     name: 📦 Create Release with GitHub CLI
     permissions:
       contents: write
-    runs-on: github-runner
+    runs-on: ubuntu-latest
 
     env:
       WEBHOOK_URL: ${{ secrets.RELEASE_WEBHOOK_URL }}
