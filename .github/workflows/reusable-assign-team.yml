@@ -1,0 +1,70 @@
+# 路径: channelwill/lid-k8s/.github/workflows/reusable-assign-team.yml
+name: Reusable Team Assignment Logic
+
+on:
+  workflow_call:
+    # 既然使用了 secrets: inherit，这里声明 secrets 是为了文档化和校验
+    secrets:
+      APP_ID:
+        required: true
+      APP_PRIVATE_KEY:
+        required: true
+
+jobs:
+  assign-logic:
+    runs-on: github-runner  # 保持和你原脚本一致
+
+    steps:
+      - name: 1. Generate GitHub App Token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app_id: ${{ secrets.APP_ID }}
+          private_key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: 2. Assign Admin Team Based on Repo Name
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          # 在可复用工作流中，github.repository 指的是“调用者”的仓库，这正是我们要的
+          ORG: ${{ github.repository_owner }}
+          REPO_FULL_NAME: ${{ github.repository }} 
+        run: |
+          echo "Starting Team Assignment Logic..."
+          
+          REPO=$(echo "$REPO_FULL_NAME" | cut -d '/' -f 2)
+          echo "Processing Repository: '$REPO'"
+
+          if [[ -z "$REPO" ]]; then
+            echo "Error: Extracted repository name is empty."
+            exit 1
+          fi
+
+          DEPT=$(echo "$REPO" | cut -d '-' -f 1)
+
+          if [[ -z "$DEPT" ]] || [[ "$DEPT" == "$REPO" ]]; then
+            echo "Could not determine department prefix from '$REPO'. Stopping."
+            exit 0
+          fi
+
+          TEAM_SLUG="${DEPT}-admin"
+          echo "Target Team Slug: '$TEAM_SLUG'"
+
+          if ! gh api "/orgs/$ORG/teams/$TEAM_SLUG" --silent; then
+            echo "Team '$TEAM_SLUG' does not exist. Skipping."
+            exit 0
+          fi
+          
+          existing_teams=$(gh api "/repos/$ORG/$REPO/teams" --jq ".[].slug")
+          if echo "$existing_teams" | grep -q "^$TEAM_SLUG$"; then
+            echo "Team '$TEAM_SLUG' is already assigned."
+            exit 0
+          fi
+
+          echo "Assigning team '$TEAM_SLUG' with 'maintain' permission..."
+          
+          gh api \
+            --method PUT \
+            "/orgs/$ORG/teams/$TEAM_SLUG/repos/$ORG/$REPO" \
+            -f permission='maintain'
+
+          echo "Successfully assigned team '$TEAM_SLUG'."
