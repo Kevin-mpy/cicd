@@ -1,0 +1,193 @@
+# .github/workflows/pr-description-generator.yml
+
+name: "🤖 Reusable: PR Description Generator"
+
+# 声明为可复用工作流 (workflow_call)
+on:
+  workflow_call:
+    inputs:
+      # PR 编号是必须的，用于 gh cli 定位要编辑的 PR
+      pr_number:
+        description: "The number of the Pull Request to update"
+        required: true
+        type: number
+      # PR 的源分支名称
+      source_branch:
+        description: "The source branch of the PR (e.g., feature/my-cool-feature)"
+        required: true
+        type: string
+      # PR 的目标分支名称
+      target_branch:
+        description: "The target branch of the PR (e.g., main or release)"
+        required: true
+        type: string
+      # 触发 PR 的原始作者
+      pr_author:
+        description: "The author of the Pull Request"
+        required: true
+        type: string
+    secrets:
+      # 新增：让调用者可以传入用于 PR 更新的 Webhook URL
+      PR_WEBHOOK_URL:
+        description: 'The URL to send the PR update notification to'
+        required: false
+  # 添加一个 push 触发器，但告诉它忽略所有文件的变更。
+  # 这会阻止 GitHub Actions 在 push 时为这个文件创建“无任务运行”的失败记录。
+  push:
+    paths-ignore:
+      - '**'
+
+jobs:
+  generate-and-update:
+    name: "🤖 Generate and Update PR Content"
+    permissions:
+      contents: read
+      pull-requests: write
+    runs-on: github-runner
+
+    # 设置环境变量
+    env:
+      WEBHOOK_URL: ${{ secrets.PR_WEBHOOK_URL }}
+
+    steps:
+      # 步骤 1: 检出代码库，这是为了获取 git 历史
+      - name: "🔄 Checkout Repository"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 步骤 2: 生成所有 PR 内容 (摘要和详细日志)
+      - name: "📝 Generate All PR Content"
+        id: final_content
+        run: |
+          FINAL_BODY_FILE=$(mktemp)
+          CHANGELOG_DETAILS_FILE=$(mktemp)
+          COMMIT_RANGE="origin/${{ inputs.target_branch }}..origin/${{ inputs.source_branch }}"
+
+          COMMIT_LOG_MARKDOWN=$(git log "$COMMIT_RANGE" --no-merges --pretty=format:"- [%h](${{ github.server_url }}/${{ github.repository }}/commit/%H) %s - by %an")
+
+          # --- 2. 统一处理所有类别 (摘要和详细日志) ---
+          summary_rows=()
+          all_patterns=()
+
+          # 清空详细日志文件
+          > "$CHANGELOG_DETAILS_FILE"
+
+          # 定义所有类别信息的单一数据源。
+          # 格式: Pattern | Emoji | Display Name
+          # 任何在此定义的类别，只要有 commits，就会同时出现在摘要和详细日志中。
+          while IFS='|' read -r pattern emoji display_name; do
+            # 清理可能存在的前后空格
+            pattern=$(echo "$pattern" | xargs)
+            emoji=$(echo "$emoji" | xargs)
+            display_name=$(echo "$display_name" | xargs)
+            
+            all_patterns+=("$pattern")
+
+            commits=$(echo "$COMMIT_LOG_MARKDOWN" | grep -i -E -- "$pattern" || true)
+
+            if [[ -n "$commits" ]]; then
+              # 生成详细日志部分
+              echo -e "\n### $emoji $display_name\n" >> "$CHANGELOG_DETAILS_FILE"
+              echo "$commits" >> "$CHANGELOG_DETAILS_FILE"
+
+              # 同时生成摘要部分
+              count=$(echo "$commits" | wc -l)
+              summary_rows+=("| $emoji $display_name | $count |")
+            fi
+          done <<'CATEGORIES'
+            feat(ure)?(\(.*\))?:      | ✨ | New Features
+            fix(es)?(\(.*\))?:        | 🐛 | Bug Fixes
+            refactor(\(.*\))?:        | 🔨 | Refactoring
+            perf(\(.*\))?:            | ⚡️ | Performance Improvements
+            ci(\(.*\))?:              | 🤖 | CI/CD
+            docs?(\(.*\))?:           | 📚 | Documentation
+            build(\(.*\))?:           | 📦 | Build System
+            test(\(.*\))?:            | ✅ | Tests
+            \bchore(\(.*\))?:         | ⚙️ | Chores
+          CATEGORIES
+
+          # --- 3. 处理 "Other" 类型的 Commits，并将其也加入摘要 ---
+          ALL_PATTERNS_REGEX=$(IFS='|'; echo "${all_patterns[*]}")
+          other_commits=$(echo "$COMMIT_LOG_MARKDOWN" | grep -i -v -E "$ALL_PATTERNS_REGEX" || true)
+          if [[ -n "$other_commits" ]]; then
+            # 添加到详细日志
+            echo -e "\n### 🔧 Other Changes\n" >> "$CHANGELOG_DETAILS_FILE"
+            echo "$other_commits" >> "$CHANGELOG_DETAILS_FILE"
+
+            # 统计其它的commit
+            other_count=$(echo "$other_commits" | wc -l)
+            summary_rows+=("| 🔧 Other Changes | $other_count |")
+          fi
+
+          # --- 4. 构建最终的摘要表格 (修复版) ---
+          if [ ${#summary_rows[@]} -eq 0 ]; then
+            SUMMARY_CONTENT="This PR includes general updates and improvements."
+          else
+            TABLE_HEADER="| Change Type | Count |\n| :--- | :--- |"
+            # 使用 printf 将数组元素用换行符连接，生成表格主体
+            printf -v TABLE_BODY '%s\n' "${summary_rows[@]}"
+            # 再次使用 printf 并带上 %b 来解释 TABLE_HEADER 中的 \n
+            printf -v SUMMARY_CONTENT "%b" "${TABLE_HEADER}\n${TABLE_BODY}"
+          fi
+
+          # --- 5. 组合最终的 PR 描述 ---
+          CHANGELOG_DETAILS=$(cat "$CHANGELOG_DETAILS_FILE")
+          cat <<EOF > "$FINAL_BODY_FILE"
+          ### 📝 PR Summary
+          ${SUMMARY_CONTENT}
+
+          **PR Author**: @${{ inputs.pr_author }}
+
+          ---
+
+          ### 🚀 Changes
+          ${CHANGELOG_DETAILS}
+          EOF
+
+          echo "description_path=$FINAL_BODY_FILE" >> "$GITHUB_OUTPUT"
+
+          # --- 6. 生成 PR 标题 ---
+          TITLE="Merge ${{ inputs.source_branch }} into ${{ inputs.target_branch }} ($(date -u +'%Y-%m-%d %H:%M UTC'))"
+          echo "title=$TITLE" >> "$GITHUB_OUTPUT"
+
+      # 步骤 3: 更新 Pull Request
+      - name: "📤 Update Pull Request Title & Description"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          echo "Updating PR #${PR_NUMBER}..."
+          gh pr edit "$PR_NUMBER" \
+            --title "${{ steps.final_content.outputs.title }}" \
+            --body-file "${{ steps.final_content.outputs.description_path }}"
+          echo "PR updated successfully."
+
+      # 步骤 4: 在 PR 更新成功后发送通知
+      - name: '🔔 Send Webhook Notification'
+        # 条件：检查传入的环境变量 WEBHOOK_URL 是否为空
+        if: ${{ success() && env.WEBHOOK_URL != '' }}
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+          PR_TITLE: ${{ steps.final_content.outputs.title }}
+          PR_AUTHOR: ${{ inputs.pr_author }}
+          REPO_NAME: ${{ github.repository }}
+          PR_URL: "https://github.com/${{ github.repository }}/pull/${{ inputs.pr_number }}"
+        run: |
+          # 准备 JSON payload
+          JSON_PAYLOAD=$(printf '{ "repository": "%s", "pr_number": %s, "pr_title": "%s", "pr_author": "%s", "pr_url": "%s", "message": "🤖 PR #%s (''%s'') has been automatically updated." }'
+          "$REPO_NAME" \
+          "$PR_NUMBER" \
+          "$PR_TITLE" \
+          "$PR_AUTHOR" \
+          "$PR_URL" \
+          "$PR_NUMBER" \
+          "$PR_TITLE")
+
+          echo "Sending notification to webhook..."
+          echo "Payload: $JSON_PAYLOAD"
+          
+          # 使用 curl 发送 POST 请求
+          curl -X POST -H "Content-Type: application/json" \
+               -d "$JSON_PAYLOAD" \
+               "$WEBHOOK_URL"
